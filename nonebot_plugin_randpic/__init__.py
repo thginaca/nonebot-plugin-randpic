@@ -2,21 +2,24 @@ import time
 import uuid
 from httpx import AsyncClient
 import ssl
+from typing import Any, Set, Tuple
 from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent
 from nonebot.adapters.onebot.v11 import GROUP, GROUP_ADMIN, GROUP_OWNER
-from nonebot.plugin import on_fullmatch
+from nonebot.plugin import on_message, on_regex, on_fullmatch
 from nonebot.plugin import PluginMetadata
-from nonebot.params import Arg
+from nonebot.params import Arg, RegexGroup
+from nonebot.rule import Rule
 from nonebot import get_driver, Driver
 from nonebot.log import logger
 import hashlib
 import aiosqlite
-from nonebot.params import Fullmatch
 from urllib import parse
 from urllib.parse import urlparse
 import importlib
 import imagehash
 from .config import *
+from .config import save_commands_file, is_commands_file_writable, VALID_COMMAND_PATTERN
+from . import config as _config
 from .ali_oss import *
 from .compress import compress_image_from_bytes, get_image_extension, compute_phash
 from .web import StaticImageGalleryGenerator
@@ -31,12 +34,25 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"nonebot.adapters.onebot.v11"},
 )
 
-randpic_command_tuple: Tuple[str, ...] = tuple(set(randpic_command_list))  # 形成指令元组
-randpic_command_add_tuple = tuple("添加" + tup for tup in randpic_command_tuple)  # 形成添加指令元组
+current_commands: Set[str] = set(randpic_command_list)  # 当前生效的指令集合（运行时可变）
 randpic_path = Path(randpic_store_dir_path)
 randpic_img_path = randpic_path / 'img'
 randpic_database_path = randpic_path / 'database'
-randpic_command_path_tuple = tuple(randpic_img_path / command for command in randpic_command_tuple)  # 形成指令文件夹路径元组
+
+
+def _persist_commands() -> bool:
+    """把当前命令集合全量写回 JSON。
+    若启动时检测到 JSON 损坏，则跳过写入，避免覆盖管理员的原始内容。
+    返回是否真的写入。
+    """
+    if not is_commands_file_writable():
+        logger.warning(
+            f"{_config.COMMANDS_FILENAME} 处于损坏状态，跳过本次持久化。"
+            f"新增的指令仅在本次会话内生效，重启后会丢失。"
+        )
+        return False
+    save_commands_file(randpic_store_dir_path, sorted(current_commands))
+    return True
 
 
 randpic_filename: str = 'randpic_{command}_{index}'
@@ -64,8 +80,11 @@ async def connect():
 
 # 创建所需文件夹和数据库
 async def create_dir():
+    command_list = sorted(current_commands)
+
     # 先创建文件夹
-    for path in randpic_command_path_tuple:
+    for command in command_list:
+        path = randpic_img_path / command
         if not path.exists():
             logger.warning('未找到{path}文件夹，准备创建{path}文件夹...'.format(path=path))
             path.mkdir(parents=True, exist_ok=True)
@@ -73,7 +92,7 @@ async def create_dir():
     cursor = await connection.cursor()
 
     # 创建表
-    for command in randpic_command_tuple:
+    for command in command_list:
         await cursor.execute('DROP table if exists Pic_of_{command};'.format(command=command))
         await cursor.execute('''
             CREATE TABLE IF NOT EXISTS Pic_of_{command} (
@@ -85,10 +104,9 @@ async def create_dir():
         await connection.commit()
 
     # 读取所有文件夹文件，调整文件夹内图片，并写入数据库
-    for index in range(len(randpic_command_path_tuple)):
+    for command in command_list:
         global randpic_filename
-        path: Path = randpic_command_path_tuple[index]
-        command = randpic_command_tuple[index]
+        path: Path = randpic_img_path / command
         randpic_file_list = os.listdir(path)
 
         # 文件名哈希化
@@ -98,7 +116,7 @@ async def create_dir():
         for i in range(len(randpic_file_list)):
             filename = randpic_file_list[i]
             filename_without_extension, filename_extension = os.path.splitext(filename)
-            format_str = randpic_filename.format( command=randpic_command_tuple[index], index=str(i + 1).zfill(10) )
+            format_str = randpic_filename.format( command=command, index=str(i + 1).zfill(10) )
             if not filename_extension:
                 with (path / filename).open('rb') as f:
                     data = f.read()
@@ -126,7 +144,6 @@ async def create_dir():
 
             new_phash_str = compute_phash(data)
             cursor = await connection.cursor()
-            command: str = randpic_command_tuple[index]
             await cursor.execute(
                 'INSERT INTO Pic_of_{command}(img_url, phash) VALUES (?, ?)'.format(command=command),
                 (str(Path() / command / filename), new_phash_str))
@@ -156,7 +173,11 @@ def web_app_init(web_driver: Driver):
 web_app_init(driver)
 
 
-picture = on_fullmatch(randpic_command_tuple, permission=GROUP, priority=2, block=True)
+async def _is_known_command(event: GroupMessageEvent) -> bool:
+    return str(event.get_message()).strip() in current_commands
+
+
+picture = on_message(rule=Rule(_is_known_command), permission=GROUP, priority=2, block=True)
 
 
 @picture.handle()
@@ -179,14 +200,50 @@ async def pic(event: GroupMessageEvent):
         await picture.send(f'{command}出不来了，稍后再试试吧~')
 
 
-add = on_fullmatch(randpic_command_add_tuple, permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+add = on_regex(r"^添加(.+)$", permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+
+
+async def _ensure_new_command(command: str) -> None:
+    """为新指令建文件夹、建表，并加入运行时集合 + 写回 JSON。"""
+    global connection
+    path = randpic_img_path / command
+    path.mkdir(parents=True, exist_ok=True)
+    cursor = await connection.cursor()
+    await cursor.execute(
+        f'''CREATE TABLE IF NOT EXISTS Pic_of_{command} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            img_url TEXT NOT NULL,
+            phash TEXT NOT NULL
+        )'''
+    )
+    await connection.commit()
+    current_commands.add(command)
+    _persist_commands()
+    logger.info(f"已动态创建新指令分类：{command}")
 
 
 @add.got("pic", prompt="请发送图片！")
-async def add_pic(args: str = Fullmatch(), pic_list: Message = Arg('pic')):
+async def add_pic(matched: Tuple[Any, ...] = RegexGroup(), pic_list: Message = Arg('pic')):
     global connection
+    command = matched[0].strip()
+
+    # 名称校验：仅允许字母、汉字、数字
+    if not VALID_COMMAND_PATTERN.fullmatch(command):
+        await add.finish("名称仅支持字母、汉字和数字，且不能为空！")
+
+    # 若是新指令，先建文件夹与数据表，再续接添加流程
+    if command not in current_commands:
+        try:
+            await _ensure_new_command(command)
+        except Exception as e:
+            logger.warning(e)
+            await add.finish(f"创建新分类「{command}」失败！")
+        msg = f"已新建分类「{command}」，本张图片将作为首张保存。"
+        if not is_commands_file_writable():
+            msg += f"\n⚠️ {_config.COMMANDS_FILENAME} 损坏，本次新增不会持久化，重启后会丢失。请管理员尽快修复 JSON。"
+        await add.send(msg)
+
     cursor = await connection.cursor()
-    command = args.replace('添加', '')
 
     for pic_name in pic_list:
         if pic_name.type != 'image':
