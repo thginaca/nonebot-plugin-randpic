@@ -2,7 +2,7 @@ import json
 import re
 from pathlib import Path
 from pydantic import BaseModel, Extra
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 from nonebot import require
 from nonebot import get_driver
 from nonebot.log import logger
@@ -43,18 +43,22 @@ def commands_file_path(store_dir: str) -> Path:
     return Path(store_dir) / COMMANDS_FILENAME
 
 
-def load_commands_file(store_dir: str) -> List[str]:
-    """读取指令列表 JSON。
-    - 文件不存在：写入默认列表并返回。
-    - 解析失败 / 顶层非 list：置 corrupted 标记，返回空列表，运行时不再覆盖该文件。
-    - 单条非法（非 str、空、含特殊字符）：跳过并告警。
+def load_commands_file(store_dir: str) -> Dict[str, Set[int]]:
+    """读取指令配置 JSON。返回「指令名 -> 该指令被禁用的群号集合」映射。
+
+    - 文件不存在：写入默认配置并返回。
+    - 解析失败 / 顶层既不是 list 也不是 dict：置 corrupted 标记，返回空字典，运行时不再覆盖。
+    - 旧格式兼容（顶层为 list of str）：等价为「指令名 -> 空集合」，并立即迁移写回为新版 dict 格式。
+    - 新格式（顶层为 dict）：键是指令名，值是禁用群号的 list[int]。
+    - 单条非法（指令名非 str/空/含特殊字符、群号非 int）：跳过并告警。
     """
     global commands_file_corrupted
     path = commands_file_path(store_dir)
     if not path.exists():
         logger.info(f"未找到 {path}，使用默认指令列表 {DEFAULT_COMMANDS} 并写入文件")
-        save_commands_file(store_dir, DEFAULT_COMMANDS)
-        return list(DEFAULT_COMMANDS)
+        default: Dict[str, Set[int]] = {name: set() for name in DEFAULT_COMMANDS}
+        save_commands_file(store_dir, default)
+        return default
     try:
         with path.open('r', encoding='utf-8') as f:
             data = json.load(f)
@@ -64,44 +68,83 @@ def load_commands_file(store_dir: str) -> List[str]:
             f"读取 {path} 失败（JSON 格式错误）：{e}；本次启动以空指令列表运行，"
             f"且运行时不会写回此文件以避免覆盖。请修复后重启 bot。"
         )
-        return []
-    if not isinstance(data, list):
+        return {}
+
+    # 旧格式：顶层 list[str]，自动迁移为新版 dict 并立即回写
+    if isinstance(data, list):
+        logger.info(f"{path} 为旧版数组格式，将迁移为新版字典格式（每个指令带空的禁用群号列表）")
+        migrated: Dict[str, Set[int]] = {}
+        for x in data:
+            if not isinstance(x, str):
+                logger.warning(f"{path} 中忽略非字符串条目: {x!r}")
+                continue
+            name = x.strip()
+            if not name:
+                logger.warning(f"{path} 中忽略空字符串条目")
+                continue
+            if not VALID_COMMAND_PATTERN.fullmatch(name):
+                logger.warning(f"{path} 中忽略非法名称 {name!r}（仅允许字母、汉字、数字）")
+                continue
+            migrated.setdefault(name, set())
+        save_commands_file(store_dir, migrated)
+        return migrated
+
+    if not isinstance(data, dict):
         commands_file_corrupted = True
         logger.error(
-            f"{path} 顶层必须是字符串数组，得到 {type(data).__name__}；本次启动以空指令列表运行，"
+            f"{path} 顶层必须是 dict 或旧版的 list[str]，得到 {type(data).__name__}；本次启动以空指令列表运行，"
             f"且运行时不会写回此文件。"
         )
-        return []
-    result: List[str] = []
-    for x in data:
-        if not isinstance(x, str):
-            logger.warning(f"{path} 中忽略非字符串条目: {x!r}")
+        return {}
+
+    result: Dict[str, Set[int]] = {}
+    for name, disabled in data.items():
+        if not isinstance(name, str):
+            logger.warning(f"{path} 中忽略非字符串键: {name!r}")
             continue
-        name = x.strip()
+        name = name.strip()
         if not name:
-            logger.warning(f"{path} 中忽略空字符串条目")
+            logger.warning(f"{path} 中忽略空字符串键")
             continue
         if not VALID_COMMAND_PATTERN.fullmatch(name):
             logger.warning(f"{path} 中忽略非法名称 {name!r}（仅允许字母、汉字、数字）")
             continue
-        result.append(name)
-    return list(dict.fromkeys(result))  # 去重，保留首次出现的顺序
+        if not isinstance(disabled, list):
+            logger.warning(f"{path} 中指令 {name!r} 的禁用群号必须是数组，得到 {type(disabled).__name__}；视为空")
+            result.setdefault(name, set())
+            continue
+        gids: Set[int] = set()
+        for g in disabled:
+            # bool 是 int 的子类，要单独排除，避免 True/False 被当成群号
+            if isinstance(g, bool) or not isinstance(g, int):
+                logger.warning(f"{path} 中指令 {name!r} 忽略非整数群号: {g!r}")
+                continue
+            gids.add(g)
+        result[name] = gids
+    return result
 
 
-def save_commands_file(store_dir: str, commands: List[str]) -> None:
-    """全量覆盖写入指令列表 JSON。注意：调用方应先检查 is_commands_file_writable()。"""
+def save_commands_file(store_dir: str, commands: Dict[str, Set[int]]) -> None:
+    """全量覆盖写入指令配置 JSON。注意：调用方应先检查 is_commands_file_writable()。
+
+    文件结构：`{ "指令名": [禁用群号, ...], ... }`。键按字母排序，群号按升序，保证可读性。
+    """
     path = commands_file_path(store_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    serializable = {name: sorted(gids) for name, gids in sorted(commands.items())}
     with path.open('w', encoding='utf-8') as f:
-        json.dump(list(commands), f, ensure_ascii=False, indent=2)
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
 config_dict = Config.model_validate(get_driver().config.dict())
 randpic_store_dir_path: str = config_dict.randpic_store_dir_path
 randpic_banner_group = config_dict.randpic_banner_group
 
-# 指令列表唯一来源：randpic_commands.json
-randpic_command_list: List[str] = load_commands_file(randpic_store_dir_path)
+# 指令配置唯一来源：randpic_commands.json
+# 结构：{ 指令名 -> 该指令被禁用的群号集合 }；运行时被插件直接读写，保存时整体回写。
+randpic_commands_config: Dict[str, Set[int]] = load_commands_file(randpic_store_dir_path)
+# 仅作快照，保留旧名以兼容外部引用；运行期请通过 randpic_commands_config 取最新键集合。
+randpic_command_list: List[str] = list(randpic_commands_config.keys())
 
 randpic_endpoint = config_dict.randpic_endpoint
 randpic_bucket = config_dict.randpic_bucket

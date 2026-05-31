@@ -2,13 +2,13 @@ import time
 import uuid
 from httpx import AsyncClient
 import ssl
-from typing import Any, Set, Tuple
+from typing import Any, Dict, Set, Tuple
 from nonebot.adapters.onebot.v11 import MessageSegment, Message, GroupMessageEvent
 from nonebot.adapters.onebot.v11 import GROUP, GROUP_ADMIN, GROUP_OWNER
-from nonebot.plugin import on_message, on_regex, on_fullmatch
+from nonebot.plugin import on_command, on_message, on_regex, on_fullmatch
 from nonebot.plugin import PluginMetadata
-from nonebot.params import Arg, RegexGroup
-from nonebot.rule import Rule
+from nonebot.params import Arg, CommandArg, RegexGroup
+from nonebot.rule import Rule, to_me
 from nonebot import get_driver, Driver
 from nonebot.log import logger
 import hashlib
@@ -34,14 +34,16 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"nonebot.adapters.onebot.v11"},
 )
 
-current_commands: Set[str] = set(randpic_command_list)  # 当前生效的指令集合（运行时可变）
+# 当前生效的指令配置（运行时可变）：{ 指令名 -> 在该群号集合中被禁用 }。
+# 直接引用 config 模块的字典对象，保证插件内的所有修改都能在持久化时被一并写回。
+current_commands_config: Dict[str, Set[int]] = _config.randpic_commands_config
 randpic_path = Path(randpic_store_dir_path)
 randpic_img_path = randpic_path / 'img'
 randpic_database_path = randpic_path / 'database'
 
 
 def _persist_commands() -> bool:
-    """把当前命令集合全量写回 JSON。
+    """把当前指令配置全量写回 JSON。
     若启动时检测到 JSON 损坏，则跳过写入，避免覆盖管理员的原始内容。
     返回是否真的写入。
     """
@@ -51,7 +53,7 @@ def _persist_commands() -> bool:
             f"新增的指令仅在本次会话内生效，重启后会丢失。"
         )
         return False
-    save_commands_file(randpic_store_dir_path, sorted(current_commands))
+    save_commands_file(randpic_store_dir_path, current_commands_config)
     return True
 
 
@@ -67,7 +69,7 @@ driver = get_driver()
 async def _():
     logger.info("正在检查文件...")
     await connect()
-    await create_dir()
+    # await create_dir()
     logger.info("文件检查完成，欢迎使用！")
 
 # 连接数据库
@@ -80,7 +82,7 @@ async def connect():
 
 # 创建所需文件夹和数据库
 async def create_dir():
-    command_list = sorted(current_commands)
+    command_list = sorted(current_commands_config)
 
     # 先创建文件夹
     for command in command_list:
@@ -174,7 +176,12 @@ web_app_init(driver)
 
 
 async def _is_known_command(event: GroupMessageEvent) -> bool:
-    return str(event.get_message()).strip() in current_commands
+    msg = str(event.get_message()).strip()
+    disabled = current_commands_config.get(msg)
+    if disabled is None:
+        return False
+    # 在本群被禁用：rule 直接不匹配，避免 block=True 拦下其它插件
+    return event.group_id not in disabled
 
 
 picture = on_message(rule=Rule(_is_known_command), permission=GROUP, priority=2, block=True)
@@ -200,11 +207,11 @@ async def pic(event: GroupMessageEvent):
         await picture.send(f'{command}出不来了，稍后再试试吧~')
 
 
-add = on_regex(r"^添加(.+)$", permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+add = on_command("添加", permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
 
 
 async def _ensure_new_command(command: str) -> None:
-    """为新指令建文件夹、建表，并加入运行时集合 + 写回 JSON。"""
+    """为新指令建文件夹、建表，并加入运行时配置 + 写回 JSON。"""
     global connection
     path = randpic_img_path / command
     path.mkdir(parents=True, exist_ok=True)
@@ -217,22 +224,22 @@ async def _ensure_new_command(command: str) -> None:
         )'''
     )
     await connection.commit()
-    current_commands.add(command)
+    current_commands_config.setdefault(command, set())
     _persist_commands()
     logger.info(f"已动态创建新指令分类：{command}")
 
 
 @add.got("pic", prompt="请发送图片！")
-async def add_pic(matched: Tuple[Any, ...] = RegexGroup(), pic_list: Message = Arg('pic')):
+async def add_pic(args: Message = CommandArg(), pic_list: Message = Arg('pic')):
     global connection
-    command = matched[0].strip()
+    command = args.extract_plain_text().strip()
 
     # 名称校验：仅允许字母、汉字、数字
     if not VALID_COMMAND_PATTERN.fullmatch(command):
         await add.finish("名称仅支持字母、汉字和数字，且不能为空！")
 
     # 若是新指令，先建文件夹与数据表，再续接添加流程
-    if command not in current_commands:
+    if command not in current_commands_config:
         try:
             await _ensure_new_command(command)
         except Exception as e:
@@ -318,3 +325,50 @@ async def handle_oss(event: GroupMessageEvent) -> None:
     end_time = time.time()
     elapsed_time = end_time - start_time
     await OSS.finish(f'上传完成，用时: {elapsed_time:.2f}秒，地址：{endpoint}/')
+
+
+# 分群管理：@bot 禁用<指令> / @bot 启用<指令>
+disable = on_command("禁用", rule=to_me(), permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+
+
+@disable.handle()
+async def handle_disable(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
+    command = args.extract_plain_text().strip()
+    if not command:
+        await disable.finish("请指定要禁用的指令名！例如：@bot 禁用 capoo")
+    if not VALID_COMMAND_PATTERN.fullmatch(command):
+        await disable.finish("指令名称仅支持字母、汉字和数字！")
+    if command not in current_commands_config:
+        await disable.finish(f"指令「{command}」不存在！")
+    gid = event.group_id
+    disabled = current_commands_config[command]
+    if gid in disabled:
+        await disable.finish(f"指令「{command}」在本群已经是禁用状态。")
+    disabled.add(gid)
+    msg = f"已在本群禁用指令「{command}」。"
+    if not _persist_commands():
+        msg += f"\n⚠️ {_config.COMMANDS_FILENAME} 损坏，本次禁用不会持久化，重启后会丢失。请管理员尽快修复 JSON。"
+    await disable.finish(msg)
+
+
+enable = on_command("启用", rule=to_me(), permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+
+
+@enable.handle()
+async def handle_enable(event: GroupMessageEvent, args: Message = CommandArg()) -> None:
+    command = args.extract_plain_text().strip()
+    if not command:
+        await enable.finish("请指定要启用的指令名！例如：@bot 启用 capoo")
+    if not VALID_COMMAND_PATTERN.fullmatch(command):
+        await enable.finish("指令名称仅支持字母、汉字和数字！")
+    if command not in current_commands_config:
+        await enable.finish(f"指令「{command}」不存在！")
+    gid = event.group_id
+    disabled = current_commands_config[command]
+    if gid not in disabled:
+        await enable.finish(f"指令「{command}」在本群本来就没有被禁用。")
+    disabled.discard(gid)
+    msg = f"已在本群重新启用指令「{command}」。"
+    if not _persist_commands():
+        msg += f"\n⚠️ {_config.COMMANDS_FILENAME} 损坏，本次启用不会持久化，重启后会丢失。请管理员尽快修复 JSON。"
+    await enable.finish(msg)
