@@ -204,6 +204,12 @@ randpic_oss_no_upload_list=["capoo"]
 #### `上传oss` 指令
 <img src="./docs/upload_oss.png" width="375"  alt="上传oss"/>
 
+#### `禁用马哥` 指令
+<img src="./docs/disable.png" width="375"  alt="禁用马哥"/>
+
+#### `启用马哥` 指令
+<img src="./docs/enable.jpg" width="375"  alt="启用马哥"/>
+
 #### 静态页面网页效果（仅在正确配置OSS情况下生效）
 <img src="./docs/web_page.png" width="375"  alt="静态页面网页效果"/>
 
