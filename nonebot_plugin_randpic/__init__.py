@@ -69,7 +69,7 @@ driver = get_driver()
 async def _():
     logger.info("正在检查文件...")
     await connect()
-    # await create_dir()
+    await create_dir()
     logger.info("文件检查完成，欢迎使用！")
 
 # 连接数据库
@@ -79,6 +79,26 @@ async def connect():
     if not randpic_database_path.exists():
         randpic_database_path.mkdir(parents=True, exist_ok=True)
     connection = await aiosqlite.connect(randpic_database_path / "data.db")
+
+async def _is_folder_changed(command: str, folder_path: Path) -> bool:
+    cursor = await connection.cursor()
+    await cursor.execute(
+        "SELECT folder_mtime FROM folder_snapshot WHERE command = ?",
+        (command,)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return True  # 新命令，无记录
+    return int(os.path.getmtime(folder_path)) != int(row[0])
+
+async def _save_snapshot(command: str, folder_path: Path):
+    await connection.execute(
+        """INSERT OR REPLACE INTO folder_snapshot (command, folder_mtime, checked_at)
+           VALUES (?, ?, ?)""",
+        (command, os.path.getmtime(folder_path), time.time())
+    )
+    await connection.commit()
+
 
 # 创建所需文件夹和数据库
 async def create_dir():
@@ -92,9 +112,17 @@ async def create_dir():
             path.mkdir(parents=True, exist_ok=True)
 
     cursor = await connection.cursor()
-
+    await cursor.execute('''
+        CREATE TABLE IF NOT EXISTS folder_snapshot (
+            command      TEXT PRIMARY KEY,
+            folder_mtime REAL NOT NULL,
+            checked_at   REAL NOT NULL
+        );
+    ''')
     # 创建表
     for command in command_list:
+        if not await _is_folder_changed(command, randpic_img_path / command):
+            continue
         await cursor.execute('DROP table if exists Pic_of_{command};'.format(command=command))
         await cursor.execute('''
             CREATE TABLE IF NOT EXISTS Pic_of_{command} (
@@ -106,7 +134,6 @@ async def create_dir():
         await connection.commit()
 
     # 读取所有文件夹文件，调整文件夹内图片，并写入数据库
-    for command in command_list:
         global randpic_filename
         path: Path = randpic_img_path / command
         randpic_file_list = os.listdir(path)
@@ -150,6 +177,8 @@ async def create_dir():
                 'INSERT INTO Pic_of_{command}(img_url, phash) VALUES (?, ?)'.format(command=command),
                 (str(Path() / command / filename), new_phash_str))
             await connection.commit()
+
+            await _save_snapshot(command, path)
 
 def web_app_init(web_driver: Driver):
     try:
@@ -207,7 +236,7 @@ async def pic(event: GroupMessageEvent):
         await picture.send(f'{command}出不来了，稍后再试试吧~')
 
 
-add = on_command("添加", permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
+add = on_regex(r"^添加(.+)$", permission=GROUP_ADMIN | GROUP_OWNER, priority=2, block=True)
 
 
 async def _ensure_new_command(command: str) -> None:
@@ -230,9 +259,9 @@ async def _ensure_new_command(command: str) -> None:
 
 
 @add.got("pic", prompt="请发送图片！")
-async def add_pic(args: Message = CommandArg(), pic_list: Message = Arg('pic')):
+async def add_pic(matched: Tuple[Any, ...] = RegexGroup(), pic_list: Message = Arg('pic')):
     global connection
-    command = args.extract_plain_text().strip()
+    command = matched[0].strip()
 
     # 名称校验：仅允许字母、汉字、数字
     if not VALID_COMMAND_PATTERN.fullmatch(command):
