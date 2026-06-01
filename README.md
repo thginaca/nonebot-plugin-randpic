@@ -36,7 +36,7 @@ _✨ 一个发送指令就能让你的 bot 发出对应指令的图片的插件 
 - 在你预设指令（可以是多个）后，插件会检索指令，并在 `randpic/img` 目录下生成所有你预设命令作为名字的文件夹，同时在 `randpic/database` 目录下生成一个 `data.db` 的数据库文件；
 - 之后你可以通过 Bot 存储图片，也可以直接在 `<预设命令>` 文件夹下存储图片。
 
-例如你设置了其中一个触发指令为`capoo`，并且你设置了存储路径为`/data`，你可以自己直接给bot运行的服务器的`/data/randpic/img/capoo/`文件夹上传你想要的图片，并且你在群聊中通过指令让bot存储的图片也会存储在`/data/randpic/img/capoo/`里。
+例如你设置了其中一个触发指令为`capoo`，并且你设置了存储路径为`/data`（若不设置存储路径，则由 [nonebot-plugin-localstore](https://github.com/nonebot/plugin-localstore) 来指定存储路径），你可以自己直接给bot运行的服务器的`/data/randpic/img/capoo/`文件夹上传你想要的图片，并且你在群聊中通过指令让bot存储的图片也会存储在`/data/randpic/img/capoo/`里。
 
 你可以在bot未启动期间任意修改图片文件夹内的所有内容，因为在启动bot后插件会自动做图片配置检查，因此你不用担心自己修改图片后会导致数据库与文件夹内容不同步。
 
